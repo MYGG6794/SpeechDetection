@@ -24,23 +24,30 @@ def resource_path(relative_path):
 class SpeechDetector(QThread):
     frame_signal = pyqtSignal(np.ndarray)
     speech_signal = pyqtSignal(bool)
-    log_signal = pyqtSignal(dict)  # 添加日志信号
+    log_signal = pyqtSignal(dict)
     
     def __init__(self):
         super().__init__()
         self.running = True
         self.detection_threshold = 0.5
         self.roi_scale = 1.0
-        self.min_mouth_aspect_ratio = 0.35  # 增加默认阈值
+        self.min_mouth_aspect_ratio = 0.35
         
-        # 添加状态持续时间计数器
+        # 性能优化参数
+        self.frame_skip = 1  # 每隔多少帧进行一次完整检测
+        self.frame_count = 0
+        self.target_fps = 30  # 目标帧率
+        self.frame_interval = 1.0 / self.target_fps
+        self.last_face_position = None  # 缓存上一次检测到的人脸位置
+        
+        # 状态检测参数
         self.speaking_frames = 0
         self.silent_frames = 0
         self.current_speaking_state = False
-        self.SPEAKING_THRESHOLD_FRAMES = 2  # 至少检测到2帧说话才触发
-        self.SILENT_THRESHOLD_FRAMES = 30   # 至少30帧未检测到说话才认为停止说话
+        self.SPEAKING_THRESHOLD_FRAMES = 2
+        self.SILENT_THRESHOLD_FRAMES = 30
 
-        # 使用resource_path获取正确的模型文件路径
+        # 加载分类器
         face_cascade_path = resource_path("models/haarcascade_frontalface_default.xml")
         mouth_cascade_path = resource_path("models/haarcascade_smile.xml")
         
@@ -51,18 +58,39 @@ class SpeechDetector(QThread):
             raise RuntimeError(f"无法加载人脸检测器: {face_cascade_path}")
         if not self.mouth_cascade.load(mouth_cascade_path):
             raise RuntimeError(f"无法加载嘴部检测器: {mouth_cascade_path}")
-        
-    def set_detection_threshold(self, value):
-        self.detection_threshold = value / 100.0
-        
-    def set_roi_scale(self, value):
-        self.roi_scale = value / 100.0
-        
-    def set_min_mouth_aspect_ratio(self, value):
-        self.min_mouth_aspect_ratio = value / 100.0
-        
+    
     def detect_faces(self, frame):
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        # 缩小图像以提高性能
+        scale = 0.5
+        small_frame = cv2.resize(frame, (0, 0), fx=scale, fy=scale)
+        gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
+        
+        # 使用上一次的人脸位置作为ROI
+        if self.last_face_position is not None:
+            x, y, w, h = self.last_face_position
+            # 扩大搜索区域
+            x = max(0, int(x * scale - w * 0.2))
+            y = max(0, int(y * scale - h * 0.2))
+            roi_w = min(small_frame.shape[1] - x, int(w * scale * 1.4))
+            roi_h = min(small_frame.shape[0] - y, int(h * scale * 1.4))
+            roi = gray[y:y+roi_h, x:x+roi_w]
+            
+            faces = self.face_cascade.detectMultiScale(
+                roi,
+                scaleFactor=1.1,
+                minNeighbors=5,
+                minSize=(15, 15),
+                flags=cv2.CASCADE_SCALE_IMAGE
+            )
+            
+            if len(faces) > 0:
+                # 调整回原始坐标
+                faces = [(int((x + x1)/scale), int((y + y1)/scale),
+                         int(w1/scale), int(h1/scale)) for (x1, y1, w1, h1) in faces]
+                self.last_face_position = faces[0]
+                return faces
+        
+        # 如果没有找到人脸，进行全图搜索
         faces = self.face_cascade.detectMultiScale(
             gray,
             scaleFactor=1.1,
@@ -70,17 +98,26 @@ class SpeechDetector(QThread):
             minSize=(30, 30),
             flags=cv2.CASCADE_SCALE_IMAGE
         )
-        return [tuple(map(int, face)) for face in faces]
         
+        if len(faces) > 0:
+            # 调整回原始坐标
+            faces = [(int(x/scale), int(y/scale),
+                     int(w/scale), int(h/scale)) for (x, y, w, h) in faces]
+            self.last_face_position = faces[0]
+        else:
+            self.last_face_position = None
+            
+        return faces
+
     def detect_mouth_state(self, gray, face):
         x, y, w, h = face
-        face_roi = gray[y:y+h, x:x+w]
+        # 只关注脸部下半部分
+        h_start = int(h * 0.6)
+        face_roi = gray[y+h_start:y+h, x:x+w]
         
-        # 优化 ROI 区域 - 主要关注下半部分人脸
-        h_start = int(h * 0.6)  # 从脸部60%处开始检测
-        face_roi = face_roi[h_start:h, :]
+        # 使用直方图均衡化增强对比度
+        face_roi = cv2.equalizeHist(face_roi)
         
-        # 检测嘴部
         mouths = self.mouth_cascade.detectMultiScale(
             face_roi,
             scaleFactor=1.1,
@@ -92,23 +129,15 @@ class SpeechDetector(QThread):
         if len(mouths) == 0:
             return False, None
             
-        # 获取最大的检测结果作为嘴部区域
         mouth = max(mouths, key=lambda m: m[2] * m[3])
         mx, my, mw, mh = mouth
         
-        # 调整y坐标以匹配原始人脸坐标
         my += h_start
-        
-        # 计算嘴部纵横比 (高宽比，值越大说明嘴巴越张开)
         aspect_ratio = float(mh) / mw
-        
-        # 计算当前阈值
         speaking_threshold = self.min_mouth_aspect_ratio
         
-        # 根据高宽比判断说话状态（张嘴时，高度增加，比例变大）
         is_speaking = aspect_ratio > speaking_threshold
         
-        # 添加日志信息
         log_info = {
             "timestamp": datetime.now().strftime("%H:%M:%S.%f")[:-3],
             "aspect_ratio": float(f"{aspect_ratio:.3f}"),
@@ -118,51 +147,62 @@ class SpeechDetector(QThread):
             "mouth_height": mh
         }
         
-        # 发送日志信息
         self.log_signal.emit(log_info)
-            
         return is_speaking, (mx, my, mw, mh)
         
     def run(self):
         cap = cv2.VideoCapture(0)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        
+        last_frame_time = datetime.now()
+        
         while self.running:
+            current_time = datetime.now()
+            elapsed = (current_time - last_frame_time).total_seconds()
+            
+            if elapsed < self.frame_interval:
+                continue
+                
+            last_frame_time = current_time
             ret, frame = cap.read()
+            
             if not ret:
                 continue
                 
+            self.frame_count += 1
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            faces = self.detect_faces(frame)
             
-            is_speaking = False
-            for (x, y, w, h) in faces:
-                # 绘制人脸框
-                cv2.rectangle(frame, (x, y), (x+w, y+h), (255, 0, 0), 2)
+            # 每隔frame_skip帧进行一次完整检测
+            if self.frame_count % self.frame_skip == 0:
+                faces = self.detect_faces(frame)
                 
-                # 检测嘴部状态
-                speaking, mouth_rect = self.detect_mouth_state(gray, (x, y, w, h))
-                is_speaking = is_speaking or speaking
+                is_speaking = False
+                for (x, y, w, h) in faces:
+                    cv2.rectangle(frame, (x, y), (x+w, y+h), (255, 0, 0), 2)
+                    
+                    speaking, mouth_rect = self.detect_mouth_state(gray, (x, y, w, h))
+                    is_speaking = is_speaking or speaking
+                    
+                    if mouth_rect is not None:
+                        mx, my, mw, mh = mouth_rect
+                        cv2.rectangle(frame, 
+                                    (x + mx, y + my), 
+                                    (x + mx + mw, y + my + mh),
+                                    (0, 255, 0) if speaking else (0, 0, 255),
+                                    2)
                 
-                if mouth_rect is not None:
-                    mx, my, mw, mh = mouth_rect
-                    cv2.rectangle(frame, 
-                                (x + mx, y + my), 
-                                (x + mx + mw, y + my + mh),
-                                (0, 255, 0) if speaking else (0, 0, 255),
-                                2)
+                if is_speaking:
+                    self.speaking_frames += 1
+                    self.silent_frames = 0
+                    if self.speaking_frames >= self.SPEAKING_THRESHOLD_FRAMES:
+                        self.current_speaking_state = True
+                else:
+                    self.silent_frames += 1
+                    if self.silent_frames >= self.SILENT_THRESHOLD_FRAMES:
+                        self.current_speaking_state = False
+                        self.speaking_frames = 0
             
-            # 更新说话状态计数器
-            if is_speaking:
-                self.speaking_frames += 1
-                self.silent_frames = 0
-                if self.speaking_frames >= self.SPEAKING_THRESHOLD_FRAMES:
-                    self.current_speaking_state = True
-            else:
-                self.silent_frames += 1
-                if self.silent_frames >= self.SILENT_THRESHOLD_FRAMES:
-                    self.current_speaking_state = False
-                    self.speaking_frames = 0  # 重置说话帧计数器
-            
-            # 发送每一帧和当前状态
             self.frame_signal.emit(frame)
             self.speech_signal.emit(bool(self.current_speaking_state))
             
@@ -178,6 +218,7 @@ class WebSocketServer(QThread):
         self.running = True
         self.server = None
         self.clients = set()
+        self.loop = None
         
     def set_speaking_state(self, state):
         self.is_speaking = state
@@ -189,6 +230,8 @@ class WebSocketServer(QThread):
         
         try:
             while self.running:
+                if not self.running:
+                    break
                 data = {
                     "is_speaking": self.is_speaking,
                     "timestamp": datetime.now().isoformat()
@@ -204,21 +247,33 @@ class WebSocketServer(QThread):
                 
     async def run_server(self):
         self.server = await websockets.serve(self.handler, "localhost", self.port)
+        self.loop = asyncio.get_event_loop()
         await self.server.wait_closed()
             
     def run(self):
         asyncio.run(self.run_server())
         
+    async def close_connections(self):
+        # 关闭所有客户端连接
+        if self.clients:
+            await asyncio.gather(*[client.close() for client in self.clients])
+            self.clients.clear()
+        
     def stop(self):
         self.running = False
         if self.server:
-            self.server.close()
+            if self.loop and self.loop.is_running():
+                asyncio.run_coroutine_threadsafe(self.close_connections(), self.loop)
+                self.server.close()
+                # 等待服务器完全关闭
+                if self.loop and self.loop.is_running():
+                    asyncio.run_coroutine_threadsafe(self.server.wait_closed(), self.loop)
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("实时说话检测器")
-        self.setGeometry(100, 100, 1000, 800)  # 增加窗口大小
+        self.setGeometry(100, 100, 1000, 800)
         
         # 创建主窗口部件
         central_widget = QWidget()
@@ -257,27 +312,25 @@ class MainWindow(QMainWindow):
         
         layout.addLayout(ws_status_layout)
         
-        # 创建日志显示区域
+        # 创建日志显示区域，使用QPlainTextEdit替代QTextEdit以提高性能
         log_label = QLabel("实时检测数据:")
         log_label.setStyleSheet("font-size: 14px; font-weight: bold;")
         layout.addWidget(log_label)
 
-        # 创建用于显示实时检测数据的文本框
         self.debug_text = QTextEdit()
         self.debug_text.setReadOnly(True)
         self.debug_text.setFixedHeight(100)
         self.debug_text.setStyleSheet("font-family: Consolas, Courier; font-size: 12px;")
         layout.addWidget(self.debug_text)
 
-        # 创建状态变化日志标签
+        # 状态变化日志
         status_log_label = QLabel("状态变化日志:")
         status_log_label.setStyleSheet("font-size: 14px; font-weight: bold;")
         layout.addWidget(status_log_label)
 
-        # 创建用于显示状态变化的文本标签
         self.log_text = QLabel("检测日志:")
         self.log_text.setStyleSheet("font-family: Consolas, Courier;")
-        self.log_text.setWordWrap(True)  # 允许文本换行
+        self.log_text.setWordWrap(True)
         layout.addWidget(self.log_text)
         
         # 创建滑动条
@@ -293,17 +346,19 @@ class MainWindow(QMainWindow):
         self.detector.speech_signal.connect(self.ws_server.set_speaking_state)
         self.detector.frame_signal.connect(self.update_video_frame)
         self.detector.speech_signal.connect(self.update_status)
-        self.detector.log_signal.connect(self.update_debug_text)  # 连接检测日志信号
+        self.detector.log_signal.connect(self.update_debug_text)
         self.ws_server.status_signal.connect(self.ws_status_text.setText)
         
-        # 用于日志记录
+        # UI更新优化
+        self.last_update_time = datetime.now()
+        self.update_interval = 0.1  # 100ms
         self.last_state = False
         self.log_entries = []
         
         # 启动线程
         self.detector.start()
         self.ws_server.start()
-
+        
     def create_slider(self, name, min_val, max_val, default, layout, slot):
         # 创建水平布局来放置标签、滑动条和数值
         slider_layout = QHBoxLayout()
@@ -335,12 +390,16 @@ class MainWindow(QMainWindow):
         layout.addLayout(slider_layout)
         
     def update_video_frame(self, frame):
-        # 将OpenCV的BGR图像转换为Qt可显示的格式
+        current_time = datetime.now()
+        if (current_time - self.last_update_time).total_seconds() < self.update_interval:
+            return
+            
+        self.last_update_time = current_time
+        
         height, width, channel = frame.shape
         bytes_per_line = 3 * width
         q_image = QImage(frame.data, width, height, bytes_per_line, QImage.Format.Format_BGR888)
         
-        # 根据标签大小缩放图像
         scaled_pixmap = QPixmap.fromImage(q_image).scaled(
             self.video_label.size(),
             Qt.AspectRatioMode.KeepAspectRatio,
@@ -349,27 +408,30 @@ class MainWindow(QMainWindow):
         self.video_label.setPixmap(scaled_pixmap)
         
     def update_status(self, is_speaking):
-        # 更新状态标签
+        if is_speaking == self.last_state:
+            return
+            
         status_text = "检测到说话" if is_speaking else "未检测到说话"
         self.status_label.setText(status_text)
         self.status_label.setStyleSheet(
             f"font-size: 24px; font-weight: bold; color: {'green' if is_speaking else 'red'}"
         )
         
-        # 记录检测状态变化
-        if is_speaking != self.last_state:
-            timestamp = datetime.now().strftime("%H:%M:%S")
-            state_log = f"[{timestamp}] {'开始说话' if is_speaking else '停止说话'}"
-            self.log_entries.insert(0, state_log)
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        state_log = f"[{timestamp}] {'开始说话' if is_speaking else '停止说话'}"
+        self.log_entries.insert(0, state_log)
+        
+        if len(self.log_entries) > 10:
+            self.log_entries.pop()
             
-            # 保持最近的10条日志
-            if len(self.log_entries) > 10:
-                self.log_entries.pop()
-            
+        self.log_text.setText("\n".join(self.log_entries))
         self.last_state = is_speaking
         
     def update_debug_text(self, log_info):
-        # 更新实时检测数据显示
+        current_time = datetime.now()
+        if (current_time - self.last_update_time).total_seconds() < self.update_interval:
+            return
+            
         debug_text = f"时间: {log_info['timestamp']}\n"
         debug_text += f"嘴部高宽比: {log_info['aspect_ratio']:.3f}\n"
         debug_text += f"当前阈值: {log_info['threshold']:.3f}\n"
@@ -379,10 +441,16 @@ class MainWindow(QMainWindow):
         self.debug_text.setText(debug_text)
         
     def closeEvent(self, event):
+        # 优化关闭流程
         self.detector.running = False
-        self.detector.wait()
         self.ws_server.stop()
-        self.ws_server.wait()
+        
+        # 给线程一些时间来清理
+        if not self.detector.wait(1000):  # 等待最多1秒
+            self.detector.terminate()
+        if not self.ws_server.wait(1000):  # 等待最多1秒
+            self.ws_server.terminate()
+            
         super().closeEvent(event)
 
 if __name__ == "__main__":
